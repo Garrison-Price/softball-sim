@@ -75,11 +75,12 @@ select {
 <body>
 <div id="hud">
   <button class="btn active" id="btnHit" onclick="newHit()">HIT [Space]</button>
-  <button class="btn active" id="btnView" onclick="toggleView()">TOP-DOWN</button>
-  <button class="btn active" id="btnCtrl" onclick="toggleControl()">CLICK</button>
+  <button class="btn active" id="btnView" onclick="toggleView()">PERSPECTIVE</button>
+  <button class="btn active" id="btnCtrl" onclick="toggleControl()">WASD</button>
   <label style="font-size:11px;color:#8ac">Pos:
     <select id="selPos" onchange="changePosition(this.value)">
-      <option value="cf">CF</option>
+      <option value="lc">LC</option>
+      <option value="rc">RC</option>
       <option value="lf">LF</option>
       <option value="rf">RF</option>
       <option value="ss">SS</option>
@@ -118,18 +119,20 @@ const MOUND_Y = 43;
 const FENCE_R = 220;
 
 const START_POS = {
-  cf:  { x: 0,    y: 192 },
+  lc:  { x: -48,  y: 188 },
+  rc:  { x: 48,   y: 188 },
   lf:  { x: -95,  y: 168 },
   rf:  { x: 95,   y: 168 },
-  ss:  { x: -28,  y: 70  },
-  '2b':{ x: 30,   y: 70  },
-  '3b':{ x: -56,  y: 42  },
-  '1b':{ x: 56,   y: 42  },
+  ss:  { x: -32,  y: 72  },
+  '2b':{ x: 28,   y: 72  },
+  '3b':{ x: -42,  y: 55  },
+  '1b':{ x: 42,   y: 55  },
 };
 
 // Landing zones per position — randomized within these
 const ZONES = {
-  cf:  { xR: [-65,  65],  yR: [145, 215] },
+  lc:  { xR: [-75,   5],  yR: [145, 215] },
+  rc:  { xR: [-5,   75],  yR: [145, 215] },
   lf:  { xR: [-150, -35], yR: [135, 210] },
   rf:  { xR: [35,  150],  yR: [135, 210] },
   ss:  { xR: [-65,   5],  yR: [45,  105] },
@@ -140,11 +143,11 @@ const ZONES = {
 
 // ===== STATE =====
 const state = {
-  view: 'topdown',
-  control: 'click',
+  view: 'perspective',
+  control: 'wasd',
   difficulty: 'medium',
   phase: 'idle',
-  pos: 'cf',
+  pos: 'lc',
   handedness: 'right',
   fielder: { x: 0, y: 192, vx: 0, vy: 0 },
   target: { x: 0, y: 192 },
@@ -243,19 +246,35 @@ function createHit(pos) {
       ball.vz = 0.5 * G * hangTime;
 
       // Assign spin based on hit direction and batter handedness.
-      // Right-handed batter: pull to LF → backspin (lift/float); oppo to RF → sidespin (curves right).
-      // Left-handed batter: mirrored.
+      // Physics model: as hit angle increases toward foul lines, the batter's swing arc
+      // rotates the spin axis from pure backspin (lift/carry) toward sidespin (lateral curve).
+      // This is non-linear — extreme angles near the foul lines curve disproportionately more.
+      // Pull balls: backspin (lift) dominates, with a hook toward the pull-side foul at extremes.
+      // Oppo balls: sidespin (slice) dominates, growing quadratically with angle.
       const hitAngle = Math.atan2(ball.vx, Math.max(1, ball.vy)); // radians from CF line
       const norm = Math.max(-1, Math.min(1, hitAngle / (Math.PI / 4)));
       const righty = state.handedness === 'right';
-      const pullAmt = righty ? Math.max(0, -norm) : Math.max(0, norm);
-      const oppoAmt = righty ? Math.max(0, norm)  : Math.max(0, -norm);
+      // signedNorm: positive = pulled (LF for righty), negative = oppo (RF for righty)
+      const signedNorm = righty ? -norm : norm;
+      const absNorm = Math.abs(signedNorm);
+      // Quadratic scaling: a ball at absNorm=1 (near foul) curves ~4x more than at absNorm=0.5
+      const curveFactor = absNorm * absNorm;
       const driftDir = righty ? 1 : -1;
       const typeMult = type === 'popup' ? 0.25 : type === 'liner' ? 0.8 : 1.0;
-      ball.spin = {
-        lift:  pullAmt * 0.014 * typeMult,          // backspin → upward lift
-        drift: oppoAmt * 0.018 * typeMult * driftDir, // sidespin → lateral curve
-      };
+      if (signedNorm >= 0) {
+        // Pulled ball: backspin (carry) + hook toward pull-side foul at extreme angles
+        ball.spin = {
+          lift:  signedNorm * 0.016 * typeMult,
+          drift: -curveFactor * 0.014 * driftDir * typeMult,
+        };
+      } else {
+        // Opposite-field ball: reduced lift, slice that grows quadratically with angle
+        const o = -signedNorm;
+        ball.spin = {
+          lift:  o * 0.008 * typeMult,
+          drift: curveFactor * 0.022 * driftDir * typeMult,
+        };
+      }
     }
 
     if (isCatchable(ball, sp)) return ball;
@@ -320,12 +339,12 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 
 function resize() {
-  const maxW = Math.min(window.innerWidth, 1000);
+  const maxW = Math.min(window.innerWidth, 1920);
   const hudH = document.getElementById('hud').offsetHeight;
   const helpH = document.getElementById('helpbar').offsetHeight;
   const avail = window.innerHeight - hudH - helpH;
   canvas.width  = maxW;
-  canvas.height = Math.min(avail, Math.round(maxW * 0.62));
+  canvas.height = Math.min(avail, Math.round(maxW * 0.56));
 }
 resize();
 window.addEventListener('resize', () => { resize(); });
@@ -448,6 +467,18 @@ function renderTopDown() {
     });
 
     if (!ball.landed && (ball.alpha > 0 || ball.z > 0.5)) {
+      // Predicted landing marker — dashed circle + dotted line from shadow to landing
+      if (ball.landX !== undefined && ball.z > 0.5) {
+        const lp = td(ball.landX, ball.landY);
+        const gp2 = td(ball.x, ball.y);
+        ctx.strokeStyle = 'rgba(255,200,50,0.55)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.arc(lp.x, lp.y, 11, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(gp2.x, gp2.y); ctx.lineTo(lp.x, lp.y); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
       // Shadow
       const gp = td(ball.x, ball.y);
       ctx.fillStyle = `rgba(0,0,0,${0.35 * ball.alpha})`;
@@ -613,6 +644,36 @@ function renderPerspective() {
   gnd.addColorStop(1,   '#2c6025');
   ctx.fillStyle = gnd;
   ctx.fillRect(0, horizonY - 2, W, H - horizonY + 2);
+
+  // Mowing stripes — alternating light/dark bands running across the field (world y-axis)
+  // These slide left-right as the camera moves laterally, giving strong motion cues.
+  {
+    const stripeW = 15; // feet per stripe
+    for (let yi = 0; yi < cam.y; yi += stripeW) {
+      const y1 = yi, y2 = Math.min(yi + stripeW, cam.y - 0.5);
+      const bl = project(cam, -230, y1, 0);
+      const br = project(cam,  230, y1, 0);
+      const tr = project(cam,  230, y2, 0);
+      const tl = project(cam, -230, y2, 0);
+      if (!bl || !br || !tr || !tl) continue;
+      ctx.fillStyle = Math.floor(yi / stripeW) % 2
+        ? 'rgba(255,255,255,0.05)'
+        : 'rgba(0,0,0,0.08)';
+      ctx.beginPath();
+      ctx.moveTo(bl.x, bl.y); ctx.lineTo(br.x, br.y);
+      ctx.lineTo(tr.x, tr.y); ctx.lineTo(tl.x, tl.y);
+      ctx.closePath(); ctx.fill();
+    }
+    // Convergence lines running toward home plate — make depth and lateral motion obvious
+    for (const wx of [-60, -45, -30, -15, 0, 15, 30, 45, 60]) {
+      const p1 = project(cam, wx, 0, 0);
+      const p2 = project(cam, wx, cam.y - 0.5, 0);
+      if (!p1 || !p2) continue;
+      ctx.strokeStyle = 'rgba(0,0,0,0.07)';
+      ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    }
+  }
 
   // Draw field polygon (helper)
   function polyFill(pts, fill, stroke) {
@@ -929,21 +990,25 @@ document.addEventListener('keydown', e => {
 });
 document.addEventListener('keyup', e => { state.keys[e.key.toLowerCase()] = false; });
 
-canvas.addEventListener('click', e => {
-  if (state.phase !== 'incoming') return;
+function applyCanvasClick(e) {
+  if (state.control !== 'click' || state.phase !== 'incoming') return;
   const rect = canvas.getBoundingClientRect();
   const sx = (e.clientX - rect.left) * (canvas.width  / rect.width);
   const sy = (e.clientY - rect.top)  * (canvas.height / rect.height);
-
   if (state.view === 'topdown') {
-    const wp = tdInverse(sx, sy);
-    state.target = wp;
+    state.target = tdInverse(sx, sy);
   } else {
     const cam = makeCamera();
     const wp = unprojectGround(cam, sx, sy);
     if (wp) state.target = wp;
   }
-});
+}
+
+let _mouseDown = false;
+canvas.addEventListener('mousedown', e => { _mouseDown = true; applyCanvasClick(e); });
+canvas.addEventListener('mousemove', e => { if (_mouseDown) applyCanvasClick(e); });
+canvas.addEventListener('mouseup',   () => { _mouseDown = false; });
+canvas.addEventListener('mouseleave', () => { _mouseDown = false; });
 
 // ===== MAIN LOOP =====
 function update(dt) {
@@ -1081,7 +1146,7 @@ document.getElementById('speedSlider').addEventListener('input', function () {
   document.getElementById('speedLabel').textContent = (FIELDER_SPEED * 0.6818).toFixed(1) + ' mph';
 });
 
-changePosition('cf');
+changePosition('lc');
 requestAnimationFrame(gameLoop);
 </script>
 </body>
