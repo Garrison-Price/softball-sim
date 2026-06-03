@@ -75,6 +75,7 @@ select {
 <body>
 <div id="hud">
   <button class="btn active" id="btnHit" onclick="newHit()">HIT [Space]</button>
+  <button class="btn" id="btnReplay" onclick="toggleReplay()">REPLAY [R]</button>
   <button class="btn active" id="btnView" onclick="toggleView()">PERSPECTIVE</button>
   <button class="btn active" id="btnCtrl" onclick="toggleControl()">WASD</button>
   <label style="font-size:11px;color:#8ac">Pos:
@@ -161,6 +162,10 @@ const state = {
   hitFlash: 0,
   keys: {},
   lastTs: 0,
+  replays: [],        // last 10 completed plays, newest first
+  currentReplay: null, // play being recorded right now
+  replayIdx: 0,       // which stored replay is shown
+  replayTime: 0,      // seconds into current replay playback
 };
 
 // ===== PHYSICS =====
@@ -1003,14 +1008,16 @@ function drawResult() {
 // ===== GAME LOGIC =====
 function newHit() {
   if (state.phase === 'incoming' || state.phase === 'ready') return;
+  if (state.phase === 'replay') toggleReplay();
   const sp = START_POS[state.pos];
-  state.fielder    = { ...sp, vx: 0, vy: 0 };
-  state.target     = { ...sp };
-  state.ball       = null;
-  state.phase      = 'ready';
-  state.readyTimer = 0;
-  state.result     = null;
-  state.pitch      = 0;
+  state.fielder        = { ...sp, vx: 0, vy: 0 };
+  state.target         = { ...sp };
+  state.ball           = null;
+  state.phase          = 'ready';
+  state.readyTimer     = 0;
+  state.result         = null;
+  state.pitch          = 0;
+  state.currentReplay  = { pos: state.pos, btype: null, frames: [], landX: 0, landY: 0, result: null };
   document.getElementById('msg').textContent = 'Ready...';
 }
 
@@ -1041,6 +1048,110 @@ function toggleControl() {
   btn.textContent = state.control === 'click' ? 'CLICK' : 'WASD';
 }
 
+function toggleReplay() {
+  if (state.phase === 'replay') {
+    state.phase = 'idle';
+    document.getElementById('btnReplay').classList.remove('active');
+    document.getElementById('msg').textContent = 'Press SPACE for next hit';
+    return;
+  }
+  if (state.replays.length === 0) {
+    document.getElementById('msg').textContent = 'No replays yet — finish a play first!';
+    return;
+  }
+  state.phase      = 'replay';
+  state.replayIdx  = 0;
+  state.replayTime = -0.8; // brief pause before playback
+  document.getElementById('btnReplay').classList.add('active');
+  document.getElementById('msg').textContent = '';
+}
+
+// ===== REPLAY RENDERING =====
+function renderReplay() {
+  const W = canvas.width, H = canvas.height;
+  const replay = state.replays[state.replayIdx];
+  if (!replay || replay.frames.length === 0) return;
+
+  // Find the frame matching current playback time
+  const t = Math.max(0, state.replayTime);
+  let fi = 0;
+  for (let i = 0; i < replay.frames.length; i++) {
+    if (replay.frames[i].t <= t) fi = i; else break;
+  }
+  const frame = replay.frames[fi];
+
+  // Build a ball-like object the top-down renderer understands
+  const trailStart = Math.max(0, fi - 40);
+  const fakeBall = {
+    x: frame.bx, y: frame.by, z: frame.bz,
+    type: replay.btype,
+    landed: frame.blanded,
+    landX: replay.landX, landY: replay.landY,
+    alpha: 1,
+    trail: replay.frames.slice(trailStart, fi).map(f => ({ x: f.bx, y: f.by, z: f.bz, a: 0.8 })),
+    spin: null,
+  };
+
+  // Temporarily swap live state with replay data so renderTopDown draws replay content
+  const savedBall    = state.ball;
+  const savedFielder = state.fielder;
+  const savedPhase   = state.phase;
+  const savedResult  = state.result;
+  const savedControl = state.control;
+
+  state.ball     = fakeBall;
+  state.fielder  = { x: frame.fx, y: frame.fy, vx: 0, vy: 0 };
+  state.phase    = 'incoming'; // triggers accuracy rings; avoids drawResult()
+  state.result   = null;
+  state.control  = 'wasd';    // suppresses click-target marker
+
+  renderTopDown();
+
+  state.ball     = savedBall;
+  state.fielder  = savedFielder;
+  state.phase    = savedPhase;
+  state.result   = savedResult;
+  state.control  = savedControl;
+
+  // ── Overlay UI ──────────────────────────────────────────────────────────────
+  const sc = tdScale();
+
+  // Result badge (shown once ball has landed)
+  if (frame.blanded && replay.result) {
+    const r = replay.result;
+    const colors = { 'CAUGHT!': '#22dd55', 'GREAT!': '#22dd55', 'GOOD': '#ddcc22', 'OK': '#dd8822', 'MISS': '#dd3333' };
+    const col = colors[r.grade] || '#fff';
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.beginPath(); ctx.roundRect(W / 2 - 90, 14, 180, 48, 6); ctx.fill();
+    ctx.fillStyle = col;
+    ctx.font = 'bold 22px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(r.grade, W / 2, 44);
+    ctx.fillStyle = '#bbb';
+    ctx.font = '11px monospace';
+    ctx.fillText(`${r.dist.toFixed(1)} ft away · ${r.pts} pts`, W / 2, 58);
+  }
+
+  // Navigation bar (top-left)
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.beginPath(); ctx.roundRect(8, 8, 230, 44, 5); ctx.fill();
+  ctx.fillStyle = '#adf';
+  ctx.font = 'bold 13px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`◀ ▶  REPLAY  ${state.replayIdx + 1} / ${state.replays.length}`, 16, 26);
+  ctx.fillStyle = '#889';
+  ctx.font = '11px monospace';
+  ctx.fillText(`${replay.pos.toUpperCase()}  ·  ← → navigate  ·  [R] exit`, 16, 44);
+
+  // Progress bar
+  const lastT   = replay.frames[replay.frames.length - 1].t;
+  const progress = Math.min(1, t / Math.max(0.01, lastT));
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(8, 56, 230, 5);
+  ctx.fillStyle = '#5a8aba';
+  ctx.fillRect(8, 56, 230 * progress, 5);
+}
+
 function score() {
   const ball = state.ball;
   if (!ball || !ball.landed) return;
@@ -1058,6 +1169,17 @@ function score() {
   state.result     = { grade, dist, pts, points: pts };
   state.phase      = 'result';
   state.resultTimer = 0;
+
+  if (state.currentReplay) {
+    state.currentReplay.result = { grade, dist, pts };
+    state.currentReplay.landX  = ball.landX;
+    state.currentReplay.landY  = ball.landY;
+    state.replays.unshift(state.currentReplay);
+    if (state.replays.length > 10) state.replays.pop();
+    state.currentReplay = null;
+    document.getElementById('btnReplay').textContent = `REPLAY [R] (${state.replays.length})`;
+  }
+
   const msg = ball.caught ? 'CAUGHT!' : `${grade} — ${dist.toFixed(1)} ft away`;
   document.getElementById('msg').textContent = msg;
   document.getElementById('scoreDisplay').textContent = `${state.score.pts} / ${state.score.max}`;
@@ -1065,6 +1187,20 @@ function score() {
 
 // ===== INPUT =====
 document.addEventListener('keydown', e => {
+  if (e.key === 'r' || e.key === 'R') { toggleReplay(); return; }
+
+  if (state.phase === 'replay') {
+    // Arrow keys navigate between stored replays
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      const dir = e.key === 'ArrowLeft' ? 1 : -1; // left = older (higher index)
+      state.replayIdx = (state.replayIdx + dir + state.replays.length) % state.replays.length;
+      state.replayTime = -0.5;
+    }
+    if (e.key === 'Escape') toggleReplay();
+    return; // don't process movement keys during replay
+  }
+
   state.keys[e.key.toLowerCase()] = true;
   if (e.key === ' ') {
     e.preventDefault();
@@ -1145,6 +1281,17 @@ function update(dt) {
       }
     }
 
+    // Record frame for replay (ball + fielder snapshot)
+    if (state.currentReplay) {
+      if (!state.currentReplay.btype) state.currentReplay.btype = ball.type;
+      state.currentReplay.frames.push({
+        t: ball.t,
+        bx: ball.x, by: ball.y, bz: ball.z,
+        blanded: ball.landed,
+        fx: state.fielder.x, fy: state.fielder.y,
+      });
+    }
+
     if (ball.landed) {
       // Fly ball / liner / popup: caught if fielder is within reach at landing
       if (!ball.caught && ball.type !== 'grounder') {
@@ -1221,9 +1368,22 @@ function update(dt) {
 function gameLoop(ts) {
   const dt = state.lastTs ? Math.min((ts - state.lastTs) / 1000, 0.05) : 0.016;
   state.lastTs = ts;
-  update(dt);
-  if (state.view === 'topdown') renderTopDown();
-  else renderPerspective();
+
+  if (state.phase === 'replay') {
+    // Advance playback time; loop after a 1.5 s pause at the end
+    state.replayTime += dt;
+    const replay = state.replays[state.replayIdx];
+    if (replay && replay.frames.length > 0) {
+      const lastT = replay.frames[replay.frames.length - 1].t;
+      if (state.replayTime > lastT + 1.5) state.replayTime = -0.5;
+    }
+    renderReplay();
+  } else {
+    update(dt);
+    if (state.view === 'topdown') renderTopDown();
+    else renderPerspective();
+  }
+
   requestAnimationFrame(gameLoop);
 }
 
