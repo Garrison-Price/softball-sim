@@ -104,6 +104,7 @@ select {
 <script>
 // ===== CONSTANTS =====
 const G = 32.2;          // ft/s² gravity
+const DRAG_K = 0.0008;   // aerodynamic drag coefficient (ft⁻¹); ~30% of physical softball value
 let FIELDER_SPEED = 14; // ft/s top speed (adjustable via slider)
 const FIELDER_ACCEL = 26; // ft/s² acceleration (0→top in ~0.7s)
 const FIELDER_DECEL = 38; // ft/s² deceleration (stops faster than starts)
@@ -300,13 +301,25 @@ function updateBall(ball, dt) {
     if (ball.trail.length > 40) ball.trail.shift();
   }
 
-  // Magnus effect: backspin lift + sidespin drift
-  if (ball.spin && ball.z > 0 && !ball.bouncing) {
-    const hs = Math.hypot(ball.vx, ball.vy);
-    if (hs > 0.1) {
-      ball.vz += ball.spin.lift  * hs * dt;          // lift opposes gravity
-      ball.vx += ball.spin.drift * ball.vy * dt;     // drift perpendicular to motion
-      ball.vy -= ball.spin.drift * ball.vx * dt;
+  if (ball.z > 0 && !ball.bouncing) {
+    const spd = Math.hypot(ball.vx, ball.vy, ball.vz);
+
+    // Aerodynamic drag: F = k·v², decelerates all axes proportionally
+    if (spd > 0.5) {
+      const dragScale = 1 - DRAG_K * spd * dt;
+      ball.vx *= dragScale;
+      ball.vy *= dragScale;
+      ball.vz *= dragScale;
+    }
+
+    // Magnus effect: backspin lift + sidespin drift
+    if (ball.spin) {
+      const hs = Math.hypot(ball.vx, ball.vy);
+      if (hs > 0.1) {
+        ball.vz += ball.spin.lift  * hs * dt;
+        ball.vx += ball.spin.drift * ball.vy * dt;
+        ball.vy -= ball.spin.drift * ball.vx * dt;
+      }
     }
   }
 
