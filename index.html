@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Softball Fielding Simulator</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #111;
+  color: #eee;
+  font-family: 'Courier New', monospace;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-height: 100vh;
+  user-select: none;
+  overflow: hidden;
+}
+#hud {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 12px;
+  width: 100%;
+  background: rgba(0,0,0,0.75);
+  border-bottom: 1px solid #333;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.btn {
+  background: #1a2a3a;
+  border: 1px solid #3a5a7a;
+  color: #8ac;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  transition: all 0.1s;
+  white-space: nowrap;
+}
+.btn:hover { background: #243444; }
+.btn.active { background: #2a4a6a; border-color: #5a8aba; color: #adf; }
+select {
+  background: #1a2a3a;
+  border: 1px solid #3a5a7a;
+  color: #8ac;
+  padding: 4px;
+  font-family: inherit;
+  font-size: 11px;
+}
+#msg {
+  color: #ffd700;
+  font-size: 12px;
+  flex: 1;
+  text-align: center;
+  min-width: 120px;
+}
+#scoreDisplay {
+  font-size: 12px;
+  color: #8af;
+  white-space: nowrap;
+}
+#canvas { display: block; cursor: crosshair; flex-shrink: 0; }
+#helpbar {
+  font-size: 10px;
+  color: #555;
+  padding: 3px 12px;
+  text-align: center;
+  flex-shrink: 0;
+  background: rgba(0,0,0,0.5);
+  width: 100%;
+}
+</style>
+</head>
+<body>
+<div id="hud">
+  <button class="btn active" id="btnHit" onclick="newHit()">HIT [Space]</button>
+  <button class="btn active" id="btnView" onclick="toggleView()">TOP-DOWN</button>
+  <button class="btn active" id="btnCtrl" onclick="toggleControl()">CLICK</button>
+  <label style="font-size:11px;color:#8ac">Pos:
+    <select id="selPos" onchange="changePosition(this.value)">
+      <option value="cf">CF</option>
+      <option value="lf">LF</option>
+      <option value="rf">RF</option>
+      <option value="ss">SS</option>
+      <option value="2b">2B</option>
+      <option value="3b">3B</option>
+      <option value="1b">1B</option>
+    </select>
+  </label>
+  <button class="btn active" id="btnHand" onclick="toggleHandedness()">RHH</button>
+  <label style="font-size:11px;color:#8ac;white-space:nowrap">Speed:
+    <input type="range" id="speedSlider" min="10" max="24" value="14"
+           style="width:70px;vertical-align:middle;accent-color:#5a8aba">
+    <span id="speedLabel">9.5 mph</span>
+  </label>
+  <div id="msg">Press SPACE to start</div>
+  <div id="scoreDisplay">0 / 0</div>
+</div>
+<canvas id="canvas"></canvas>
+<div id="helpbar">SPACE: new hit &nbsp;|&nbsp; Tab: toggle view &nbsp;|&nbsp; Click: move fielder &nbsp;|&nbsp; WASD / ↑↓←→: move</div>
+
+<script>
+// ===== CONSTANTS =====
+const G = 32.2;          // ft/s² gravity
+let FIELDER_SPEED = 14; // ft/s top speed (adjustable via slider)
+const FIELDER_ACCEL = 26; // ft/s² acceleration (0→top in ~0.7s)
+const FIELDER_DECEL = 38; // ft/s² deceleration (stops faster than starts)
+const BALL_R_WORLD = 0.5; // softball radius in feet
+
+const BASES = {
+  home:   { x: 0,   y: 0  },
+  first:  { x: 46,  y: 46 },
+  second: { x: 0,   y: 92 },
+  third:  { x: -46, y: 46 },
+};
+const MOUND_Y = 43;
+const FENCE_R = 220;
+
+const START_POS = {
+  cf:  { x: 0,    y: 192 },
+  lf:  { x: -95,  y: 168 },
+  rf:  { x: 95,   y: 168 },
+  ss:  { x: -28,  y: 70  },
+  '2b':{ x: 30,   y: 70  },
+  '3b':{ x: -56,  y: 42  },
+  '1b':{ x: 56,   y: 42  },
+};
+
+// Landing zones per position — randomized within these
+const ZONES = {
+  cf:  { xR: [-65,  65],  yR: [145, 215] },
+  lf:  { xR: [-150, -35], yR: [135, 210] },
+  rf:  { xR: [35,  150],  yR: [135, 210] },
+  ss:  { xR: [-65,   5],  yR: [45,  105] },
+  '2b':{ xR: [0,    65],  yR: [45,  105] },
+  '3b':{ xR: [-80, -20],  yR: [15,   80] },
+  '1b':{ xR: [20,   80],  yR: [15,   80] },
+};
+
+// ===== STATE =====
+const state = {
+  view: 'topdown',
+  control: 'click',
+  difficulty: 'medium',
+  phase: 'idle',
+  pos: 'cf',
+  handedness: 'right',
+  fielder: { x: 0, y: 192, vx: 0, vy: 0 },
+  target: { x: 0, y: 192 },
+  ball: null,
+  score: { attempts: 0, pts: 0, max: 0 },
+  result: null,
+  resultTimer: 0,
+  readyTimer: 0,
+  pitch: 0,
+  hitFlash: 0,
+  keys: {},
+  lastTs: 0,
+};
+
+// ===== PHYSICS =====
+// Max distance fielder can cover in time t, accounting for acceleration
+function maxReach(t) {
+  if (t <= 0) return 0;
+  const T_accel = FIELDER_SPEED / FIELDER_ACCEL;
+  if (t < T_accel) return 0.5 * FIELDER_ACCEL * t * t;
+  return 0.5 * FIELDER_ACCEL * T_accel * T_accel + FIELDER_SPEED * (t - T_accel);
+}
+
+function isCatchable(ball, sp) {
+  const REACTION = 0.3; // seconds before fielder starts moving
+
+  if (ball.type !== 'grounder') {
+    // Must reach landing spot within hang time
+    const d = Math.hypot(ball.landX - sp.x, ball.landY - sp.y);
+    return d <= maxReach(ball.hangTime - REACTION) + 8;
+  }
+
+  // Grounder: check if fielder can intercept anywhere along the ball's path
+  const initSpeed = Math.hypot(ball.vx, ball.vy);
+  const totalDist = Math.hypot(ball.landX, ball.landY - 2);
+  const dirX = ball.vx / initSpeed, dirY = ball.vy / initSpeed;
+  for (let i = 1; i <= 15; i++) {
+    const frac = i / 15;
+    const bx = dirX * totalDist * frac;
+    const by = 2 + dirY * totalDist * frac;
+    const ballTime = (totalDist * frac) / (initSpeed * 0.6); // ~60% avg speed due to bouncing
+    const d = Math.hypot(bx - sp.x, by - sp.y);
+    if (d <= maxReach(ballTime - REACTION) + 6) return true;
+  }
+  return false;
+}
+
+function createHit(pos) {
+  const sp = START_POS[pos];
+  const z = ZONES[pos];
+
+  for (let attempt = 0; attempt < 25; attempt++) {
+    let landX = z.xR[0] + Math.random() * (z.xR[1] - z.xR[0]);
+    let landY = z.yR[0] + Math.random() * (z.yR[1] - z.yR[0]);
+
+    const dist = Math.hypot(landX, landY);
+    if (dist > FENCE_R - 5) {
+      const scale = (FENCE_R - 5) / dist;
+      landX *= scale; landY *= scale;
+    }
+
+    const isOutfield = dist > 100;
+    const roll = Math.random();
+    let type, hangTime;
+
+    if (!isOutfield) {
+      if (roll < 0.45)      { type = 'grounder'; hangTime = 0; }
+      else if (roll < 0.72) { type = 'liner';    hangTime = 0.9  + Math.random() * 0.5; }
+      else                  { type = 'popup';    hangTime = 3.0  + Math.random() * 1.0; }
+    } else {
+      if (roll < 0.50)      { type = 'flyball';  hangTime = 3.8  + Math.random() * 1.5; }
+      else if (roll < 0.78) { type = 'liner';    hangTime = 1.8  + Math.random() * 0.8; }
+      else                  { type = 'grounder'; hangTime = 0; }
+    }
+
+    const ball = {
+      x: 0, y: 2, z: 3,
+      vx: 0, vy: 0, vz: 0,
+      type, hangTime, landX, landY,
+      t: 0, alpha: 1, landed: false,
+      bouncing: false,
+      trail: [],
+      _fadeAt: 9999,
+    };
+
+    if (type === 'grounder') {
+      const speed = 65 + Math.random() * 45;
+      const ang = Math.atan2(landX, landY);
+      ball.vx = speed * Math.sin(ang);
+      ball.vy = speed * Math.cos(ang);
+      ball.vz = 12 + Math.random() * 10;
+      ball.spin = { lift: 0, drift: 0 };
+    } else {
+      ball.vx = landX / hangTime;
+      ball.vy = landY / hangTime;
+      ball.vz = 0.5 * G * hangTime;
+
+      // Assign spin based on hit direction and batter handedness.
+      // Right-handed batter: pull to LF → backspin (lift/float); oppo to RF → sidespin (curves right).
+      // Left-handed batter: mirrored.
+      const hitAngle = Math.atan2(ball.vx, Math.max(1, ball.vy)); // radians from CF line
+      const norm = Math.max(-1, Math.min(1, hitAngle / (Math.PI / 4)));
+      const righty = state.handedness === 'right';
+      const pullAmt = righty ? Math.max(0, -norm) : Math.max(0, norm);
+      const oppoAmt = righty ? Math.max(0, norm)  : Math.max(0, -norm);
+      const driftDir = righty ? 1 : -1;
+      const typeMult = type === 'popup' ? 0.25 : type === 'liner' ? 0.8 : 1.0;
+      ball.spin = {
+        lift:  pullAmt * 0.014 * typeMult,          // backspin → upward lift
+        drift: oppoAmt * 0.018 * typeMult * driftDir, // sidespin → lateral curve
+      };
+    }
+
+    if (isCatchable(ball, sp)) return ball;
+  }
+
+  // Fallback: straightforward fly ball right at the fielder's zone center
+  const hangTime = 4.5;
+  const landX = (z.xR[0] + z.xR[1]) / 2;
+  const landY = (z.yR[0] + z.yR[1]) / 2;
+  return {
+    x: 0, y: 2, z: 3,
+    vx: landX / hangTime, vy: landY / hangTime, vz: 0.5 * G * hangTime,
+    type: 'flyball', hangTime, landX, landY,
+    t: 0, alpha: 1, landed: false, bouncing: false, trail: [], _fadeAt: 9999,
+  };
+}
+
+function updateBall(ball, dt) {
+  if (ball.landed) return;
+
+  if (ball.alpha > 0.05) {
+    ball.trail.push({ x: ball.x, y: ball.y, z: ball.z, a: ball.alpha });
+    if (ball.trail.length > 40) ball.trail.shift();
+  }
+
+  // Magnus effect: backspin lift + sidespin drift
+  if (ball.spin && ball.z > 0 && !ball.bouncing) {
+    const hs = Math.hypot(ball.vx, ball.vy);
+    if (hs > 0.1) {
+      ball.vz += ball.spin.lift  * hs * dt;          // lift opposes gravity
+      ball.vx += ball.spin.drift * ball.vy * dt;     // drift perpendicular to motion
+      ball.vy -= ball.spin.drift * ball.vx * dt;
+    }
+  }
+
+  ball.x  += ball.vx * dt;
+  ball.y  += ball.vy * dt;
+  ball.z  += ball.vz * dt;
+  ball.vz -= G * dt;
+  ball.t  += dt;
+
+  if (ball.t > ball._fadeAt) {
+    ball.alpha = Math.max(0, ball.alpha - dt * 2.5);
+  }
+
+  if (ball.z <= 0) {
+    if ((ball.type === 'grounder' || ball.bouncing) && Math.abs(ball.vz) > 4) {
+      ball.z = 0;
+      ball.vz = Math.abs(ball.vz) * (ball.bouncing ? 0.48 : 0.42);
+      ball.vx *= 0.88; ball.vy *= 0.88;
+      ball.bouncing = true;
+    } else {
+      ball.z = 0; ball.vz = 0; ball.vx = 0; ball.vy = 0;
+      ball.landed = true;
+      ball.landX = ball.x; ball.landY = ball.y;
+    }
+  }
+}
+
+// ===== CANVAS =====
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const maxW = Math.min(window.innerWidth, 1000);
+  const hudH = document.getElementById('hud').offsetHeight;
+  const helpH = document.getElementById('helpbar').offsetHeight;
+  const avail = window.innerHeight - hudH - helpH;
+  canvas.width  = maxW;
+  canvas.height = Math.min(avail, Math.round(maxW * 0.62));
+}
+resize();
+window.addEventListener('resize', () => { resize(); });
+
+// ===== TOP-DOWN HELPERS =====
+function tdScale() { return canvas.height / 290; }
+function tdOX()    { return canvas.width / 2; }
+function tdOY()    { return canvas.height - 35; }
+
+function td(wx, wy) {
+  const sc = tdScale(), ox = tdOX(), oy = tdOY();
+  return { x: ox + wx * sc, y: oy - wy * sc };
+}
+function tdInverse(sx, sy) {
+  const sc = tdScale(), ox = tdOX(), oy = tdOY();
+  return { x: (sx - ox) / sc, y: (oy - sy) / sc };
+}
+
+// ===== RENDER: TOP-DOWN =====
+function renderTopDown() {
+  const W = canvas.width, H = canvas.height;
+  const sc = tdScale(), ox = tdOX(), oy = tdOY();
+
+  // Background grass
+  ctx.fillStyle = '#2a6124';
+  ctx.fillRect(0, 0, W, H);
+
+  // Outfield fill (lighter between foul lines)
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(ox, oy);
+  ctx.arc(ox, oy, FENCE_R * sc, 5 * Math.PI / 4, 7 * Math.PI / 4, false);
+  ctx.closePath();
+  ctx.fillStyle = '#2e6a28';
+  ctx.fill();
+  ctx.restore();
+
+  // Infield dirt diamond
+  const hp = td(0, 0), fp = td(46, 46), sp = td(0, 92), tp = td(-46, 46);
+  ctx.fillStyle = '#c0935a';
+  ctx.beginPath();
+  ctx.moveTo(hp.x, hp.y);
+  ctx.lineTo(fp.x, fp.y);
+  ctx.lineTo(sp.x, sp.y);
+  ctx.lineTo(tp.x, tp.y);
+  ctx.closePath();
+  ctx.fill();
+
+  // Infield grass circle
+  const ctr = td(0, 46);
+  ctx.fillStyle = '#308a2a';
+  ctx.beginPath();
+  ctx.arc(ctr.x, ctr.y, 42 * sc, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Pitcher's mound
+  const mp = td(0, MOUND_Y);
+  ctx.fillStyle = '#b58848';
+  ctx.beginPath();
+  ctx.arc(mp.x, mp.y, 5 * sc, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outfield fence arc
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(ox, oy, FENCE_R * sc, 5 * Math.PI / 4, 7 * Math.PI / 4, false);
+  ctx.stroke();
+
+  // Foul lines
+  const FQ = FENCE_R * Math.SQRT1_2;
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(ox, oy); ctx.lineTo(td(FQ, FQ).x, td(FQ, FQ).y);
+  ctx.moveTo(ox, oy); ctx.lineTo(td(-FQ, FQ).x, td(-FQ, FQ).y);
+  ctx.stroke();
+
+  // Base paths
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(hp.x, hp.y); ctx.lineTo(fp.x, fp.y);
+  ctx.lineTo(sp.x, sp.y); ctx.lineTo(tp.x, tp.y);
+  ctx.closePath();
+  ctx.stroke();
+
+  // Bases
+  const baseSize = 2.8 * sc;
+  [[0,0],[46,46],[0,92],[-46,46]].forEach(([wx,wy]) => {
+    const p = td(wx, wy);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(p.x - baseSize, p.y - baseSize, baseSize*2, baseSize*2);
+  });
+
+  // Accuracy rings around fielder starting zone
+  if (state.phase === 'incoming' || state.phase === 'result') {
+    const f = td(state.fielder.x, state.fielder.y);
+    [[5, 'rgba(0,255,120,0.25)'], [12, 'rgba(255,200,0,0.18)'], [25, 'rgba(255,80,80,0.12)']].forEach(([r, col]) => {
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, r * sc, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+  }
+
+  // Ball trail
+  const ball = state.ball;
+  if (ball) {
+    ball.trail.forEach((pt, i) => {
+      const p = td(pt.x, pt.y);
+      const a = (i / ball.trail.length) * pt.a * 0.45;
+      ctx.fillStyle = `rgba(255,250,180,${a})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    if (!ball.landed && (ball.alpha > 0 || ball.z > 0.5)) {
+      // Shadow
+      const gp = td(ball.x, ball.y);
+      ctx.fillStyle = `rgba(0,0,0,${0.35 * ball.alpha})`;
+      ctx.beginPath();
+      ctx.ellipse(gp.x, gp.y, 4, 2.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      const heightPx = ball.z * sc * 0.35;
+
+      // Ball
+      if (ball.alpha > 0.05) {
+        const ballR = Math.max(3, 3.5 + ball.z * sc * 0.04);
+        ctx.fillStyle = `rgba(255,253,200,${ball.alpha})`;
+        ctx.strokeStyle = `rgba(160,145,90,${ball.alpha})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(gp.x, gp.y - heightPx, ballR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+
+    // Landing marker
+    if (ball.landed) {
+      const lp = td(ball.landX, ball.landY);
+      ctx.strokeStyle = '#ffd700';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(lp.x, lp.y, 10, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(lp.x - 7, lp.y); ctx.lineTo(lp.x + 7, lp.y);
+      ctx.moveTo(lp.x, lp.y - 7); ctx.lineTo(lp.x, lp.y + 7);
+      ctx.stroke();
+    }
+  }
+
+  // Fielder target marker (click mode)
+  if (state.control === 'click' && state.phase === 'incoming') {
+    const ft = td(state.target.x, state.target.y);
+    ctx.strokeStyle = 'rgba(100,220,100,0.55)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.arc(ft.x, ft.y, 9, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Fielder
+  {
+    const fp2 = td(state.fielder.x, state.fielder.y);
+    const ang = Math.atan2(-state.fielder.x, -state.fielder.y); // toward home
+    ctx.fillStyle = '#ee3333';
+    ctx.beginPath();
+    ctx.arc(fp2.x, fp2.y, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Direction arrow
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(fp2.x, fp2.y);
+    ctx.lineTo(fp2.x + Math.sin(ang) * 11, fp2.y - Math.cos(ang) * 11);
+    ctx.stroke();
+  }
+
+  // Hit flash
+  if (state.hitFlash > 0) {
+    ctx.fillStyle = `rgba(255,255,200,${state.hitFlash * 0.15})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Ball type label
+  if (ball && ball.t < 0.8 && ball.alpha > 0.5) {
+    const labels = { grounder: 'GROUNDER', liner: 'LINE DRIVE', flyball: 'FLY BALL', popup: 'POP UP' };
+    const label = labels[ball.type] || '';
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 60, 10, 120, 24);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, W/2, 27);
+    ctx.textAlign = 'left';
+  }
+
+  if (state.phase === 'result' && state.result) drawResult();
+}
+
+// ===== RENDER: PERSPECTIVE =====
+function makeCamera() {
+  const fx = state.fielder.x;
+  const fy = state.fielder.y;
+  const camDist = Math.hypot(fx, fy) || 0.01;
+  const fwdX = -fx / camDist;
+  const fwdY = -fy / camDist;
+  const rightX = -fy / camDist;
+  const rightY =  fx / camDist;
+  const camZ = 5.5;
+  const FOCAL = canvas.width * 0.44;
+
+  // Pitch: tilt the camera up/down around the right axis
+  const pitch = state.pitch;
+  const cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+  // Look direction (tilted up by pitch from horizontal forward)
+  const lookX = fwdX * cosP, lookY = fwdY * cosP, lookZ = sinP;
+  // Camera up (perpendicular to look in the vertical pitch plane)
+  const upX = -fwdX * sinP, upY = -fwdY * sinP, upZ = cosP;
+
+  return { x: fx, y: fy, z: camZ, fwdX, fwdY, rightX, rightY,
+           lookX, lookY, lookZ, upX, upY, upZ, cosP, sinP, FOCAL };
+}
+
+function project(cam, wx, wy, wz) {
+  const CX = canvas.width / 2;
+  const CY = canvas.height / 2;
+  const rx = wx - cam.x, ry = wy - cam.y, rz = wz - cam.z;
+  const csX = rx * cam.rightX + ry * cam.rightY;
+  const csY = rx * cam.upX   + ry * cam.upY   + rz * cam.upZ;
+  const csZ = rx * cam.lookX + ry * cam.lookY + rz * cam.lookZ;
+  if (csZ < 0.5) return null;
+  return {
+    x: CX + csX * cam.FOCAL / csZ,
+    y: CY - csY * cam.FOCAL / csZ,
+    z: csZ,
+  };
+}
+
+function unprojectGround(cam, sx, sy) {
+  const CX = canvas.width / 2;
+  const CY = canvas.height / 2;
+  // Build ray direction from screen point through the pitched camera
+  const ndcX = (sx - CX) / cam.FOCAL;
+  const ndcY = -(sy - CY) / cam.FOCAL;
+  const rdx = ndcX * cam.rightX + ndcY * cam.upX + cam.lookX;
+  const rdy = ndcX * cam.rightY + ndcY * cam.upY + cam.lookY;
+  const rdz =                     ndcY * cam.upZ  + cam.lookZ;
+  if (rdz >= 0) return null; // ray aims upward, won't hit ground
+  const t = -cam.z / rdz;
+  return { x: cam.x + t * rdx, y: cam.y + t * rdy };
+}
+
+function renderPerspective() {
+  const W = canvas.width, H = canvas.height;
+  const cam = makeCamera();
+  // Horizon screen Y: where the ground plane at infinity projects
+  // As depth→∞ along ground, csY/csZ → -sinP/cosP = -tanP, so screen_y = H/2 + tanP * FOCAL
+  const horizonY = Math.round(H / 2 + Math.tan(state.pitch) * cam.FOCAL);
+
+  // Sky
+  const sky = ctx.createLinearGradient(0, 0, 0, horizonY);
+  sky.addColorStop(0, '#162a5a');
+  sky.addColorStop(1, '#5a9ecc');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, horizonY + 2);
+
+  // Ground
+  const gnd = ctx.createLinearGradient(0, horizonY, 0, H);
+  gnd.addColorStop(0,   '#4a9a3e');
+  gnd.addColorStop(0.5, '#3a8030');
+  gnd.addColorStop(1,   '#2c6025');
+  ctx.fillStyle = gnd;
+  ctx.fillRect(0, horizonY - 2, W, H - horizonY + 2);
+
+  // Draw field polygon (helper)
+  function polyFill(pts, fill, stroke) {
+    const pp = pts.map(([wx,wy,wz=0]) => project(cam, wx, wy, wz));
+    if (pp.some(p => !p)) return;
+    ctx.beginPath();
+    ctx.moveTo(pp[0].x, pp[0].y);
+    for (let i = 1; i < pp.length; i++) ctx.lineTo(pp[i].x, pp[i].y);
+    ctx.closePath();
+    if (fill)   { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1.5; ctx.stroke(); }
+  }
+
+  function line(wx1, wy1, wx2, wy2, col, lw = 1.5) {
+    const a = project(cam, wx1, wy1, 0);
+    const b = project(cam, wx2, wy2, 0);
+    if (!a || !b) return;
+    ctx.strokeStyle = col; ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+
+  // Infield dirt
+  polyFill([
+    [0,0],[46,46],[0,92],[-46,46]
+  ], '#c0935a', null);
+
+  // Infield grass center
+  {
+    const cp = project(cam, 0, 46, 0);
+    if (cp) {
+      const r = Math.max(2, cam.FOCAL / cp.z * 40);
+      ctx.fillStyle = '#308a2a';
+      ctx.beginPath();
+      ctx.arc(cp.x, cp.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Baselines
+  const lineColor = 'rgba(255,255,255,0.65)';
+  line(0,0, 46,46,  lineColor, 2);
+  line(46,46, 0,92, lineColor, 2);
+  line(0,92, -46,46,lineColor, 2);
+  line(-46,46, 0,0, lineColor, 2);
+
+  // Foul lines
+  const FQ = FENCE_R * Math.SQRT1_2;
+  line(0, 0, FQ, FQ,  'rgba(255,255,255,0.40)', 1.5);
+  line(0, 0, -FQ, FQ, 'rgba(255,255,255,0.40)', 1.5);
+
+  // Outfield fence — lines only to avoid near-clip distortion
+  {
+    const SEGS = 24;
+    const MIN_DEPTH = 8; // skip segments closer than this to the camera
+    const pts = [];
+    for (let i = 0; i <= SEGS; i++) {
+      const ang = (i / SEGS - 0.5) * Math.PI * 0.5;
+      const wx = FENCE_R * Math.sin(ang);
+      const wy = FENCE_R * Math.cos(ang);
+      const p0 = project(cam, wx, wy, 0);
+      const p1 = project(cam, wx, wy, 10);
+      pts.push((p0 && p1 && p0.z > MIN_DEPTH) ? { p0, p1 } : null);
+    }
+    // Bottom rail
+    ctx.strokeStyle = '#5577cc';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let drawing = false;
+    pts.forEach(pt => {
+      if (!pt) { drawing = false; return; }
+      if (!drawing) { ctx.moveTo(pt.p0.x, pt.p0.y); drawing = true; }
+      else ctx.lineTo(pt.p0.x, pt.p0.y);
+    });
+    ctx.stroke();
+    // Top rail
+    ctx.beginPath();
+    drawing = false;
+    pts.forEach(pt => {
+      if (!pt) { drawing = false; return; }
+      if (!drawing) { ctx.moveTo(pt.p1.x, pt.p1.y); drawing = true; }
+      else ctx.lineTo(pt.p1.x, pt.p1.y);
+    });
+    ctx.stroke();
+    // Vertical posts every 4th segment
+    ctx.lineWidth = 1.5;
+    pts.forEach((pt, i) => {
+      if (!pt || i % 4 !== 0) return;
+      ctx.beginPath();
+      ctx.moveTo(pt.p0.x, pt.p0.y);
+      ctx.lineTo(pt.p1.x, pt.p1.y);
+      ctx.stroke();
+    });
+  }
+
+  // Pitcher's mound
+  {
+    const mp = project(cam, 0, MOUND_Y, 0.5);
+    if (mp) {
+      const r = Math.max(1, cam.FOCAL / mp.z * 4);
+      ctx.fillStyle = '#b58848';
+      ctx.beginPath();
+      ctx.ellipse(mp.x, mp.y, r, r * 0.55, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Bases
+  [[0,0],[46,46],[0,92],[-46,46]].forEach(([bx,by]) => {
+    const bp = project(cam, bx, by, 0.2);
+    if (!bp) return;
+    const s = Math.max(1, cam.FOCAL / bp.z * 1.5);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(bp.x - s, bp.y - s, s * 2, s * 2);
+  });
+
+  // Ball shadow
+  const ball = state.ball;
+  if (ball && !ball.landed && ball.alpha > 0) {
+    const sp = project(cam, ball.x, ball.y, 0);
+    if (sp) {
+      const sw = Math.max(1, cam.FOCAL / sp.z * 0.8);
+      ctx.fillStyle = `rgba(0,0,0,${0.42 * ball.alpha})`;
+      ctx.beginPath();
+      ctx.ellipse(sp.x, sp.y, sw, sw * 0.35, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    const bp = project(cam, ball.x, ball.y, ball.z);
+    if (bp && ball.alpha > 0.04) {
+      const br = Math.max(2, cam.FOCAL / bp.z * BALL_R_WORLD);
+      ctx.fillStyle = `rgba(255,253,200,${ball.alpha})`;
+      ctx.strokeStyle = `rgba(160,140,80,${ball.alpha})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(bp.x, bp.y, br, 0, Math.PI * 2);
+      ctx.fill(); ctx.stroke();
+
+    }
+  }
+
+  // Landing marker
+  if (ball && ball.landed) {
+    const lp = project(cam, ball.landX, ball.landY, 0);
+    if (lp) {
+      const s = Math.max(3, cam.FOCAL / lp.z * 2);
+      ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(lp.x, lp.y, s * 3, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(lp.x - s*2, lp.y); ctx.lineTo(lp.x + s*2, lp.y);
+      ctx.moveTo(lp.x, lp.y - s*2); ctx.lineTo(lp.x, lp.y + s*2);
+      ctx.stroke();
+    }
+  }
+
+  // Click destination on ground
+  if (state.control === 'click' && state.phase === 'incoming') {
+    const tp = project(cam, state.target.x, state.target.y, 0);
+    if (tp) {
+      const s = Math.max(2, cam.FOCAL / tp.z * 1.2);
+      ctx.strokeStyle = 'rgba(100,220,100,0.6)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.arc(tp.x, tp.y, s * 3, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // Accuracy rings projected onto ground (result phase)
+  if ((state.phase === 'incoming' || state.phase === 'result')) {
+    [[5, 'rgba(0,255,120,0.35)'], [12, 'rgba(255,200,0,0.25)'], [25, 'rgba(255,80,80,0.18)']].forEach(([r, col]) => {
+      const pts = [];
+      for (let i = 0; i < 24; i++) {
+        const a = (i / 24) * Math.PI * 2;
+        const px = project(cam, state.fielder.x + r * Math.cos(a), state.fielder.y + r * Math.sin(a), 0);
+        if (px) pts.push(px);
+      }
+      if (pts.length < 3) return;
+      ctx.strokeStyle = col; ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+      pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.closePath(); ctx.stroke();
+      ctx.setLineDash([]);
+    });
+  }
+
+  // Fielder feet indicator
+  ctx.fillStyle = 'rgba(255,80,80,0.5)';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`▼ YOU [${state.pos.toUpperCase()}]`, W / 2, H - 8);
+  ctx.textAlign = 'left';
+
+  // Hit flash
+  if (state.hitFlash > 0) {
+    ctx.fillStyle = `rgba(255,255,200,${state.hitFlash * 0.12})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Ball type label
+  if (ball && ball.t < 0.8) {
+    const labels = { grounder: 'GROUNDER', liner: 'LINE DRIVE', flyball: 'FLY BALL', popup: 'POP UP' };
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 65, 10, 130, 24);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(labels[ball.type] || '', W/2, 27);
+    ctx.textAlign = 'left';
+  }
+
+  if (state.phase === 'result' && state.result) drawResult();
+}
+
+// ===== RESULT OVERLAY =====
+function drawResult() {
+  const W = canvas.width, H = canvas.height;
+  const r = state.result;
+  const cols = { 'CAUGHT!': '#00eeff', 'GREAT!': '#00ff88', 'GOOD': '#88ff00', 'OK': '#ffcc00', 'MISS': '#ff5555' };
+  const col = cols[r.grade] || '#fff';
+  const bx = W/2 - 130, by = H/2 - 55, bw = 260, bh = 110;
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = col; ctx.lineWidth = 2;
+  ctx.strokeRect(bx, by, bw, bh);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = col;
+  ctx.font = 'bold 40px monospace';
+  ctx.fillText(r.grade, W/2, H/2 + 4);
+  ctx.fillStyle = '#ccc';
+  ctx.font = '13px monospace';
+  ctx.fillText(`${r.dist.toFixed(1)} ft away  |  +${r.points} pts`, W/2, H/2 + 26);
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#888';
+  ctx.fillText('Press SPACE for next hit', W/2, H/2 + 48);
+  ctx.textAlign = 'left';
+}
+
+// ===== GAME LOGIC =====
+function newHit() {
+  if (state.phase === 'incoming' || state.phase === 'ready') return;
+  const sp = START_POS[state.pos];
+  state.fielder    = { ...sp, vx: 0, vy: 0 };
+  state.target     = { ...sp };
+  state.ball       = null;
+  state.phase      = 'ready';
+  state.readyTimer = 0;
+  state.result     = null;
+  state.pitch      = 0;
+  document.getElementById('msg').textContent = 'Ready...';
+}
+
+function changePosition(pos) {
+  state.pos = pos;
+  const sp = START_POS[pos];
+  state.fielder = { ...sp, vx: 0, vy: 0 };
+  state.target  = { ...sp };
+  state.phase   = 'idle';
+  state.ball    = null;
+  document.getElementById('msg').textContent = `Playing ${pos.toUpperCase()} — press SPACE`;
+}
+
+function toggleView() {
+  state.view = state.view === 'topdown' ? 'perspective' : 'topdown';
+  const btn = document.getElementById('btnView');
+  btn.textContent = state.view === 'topdown' ? 'TOP-DOWN' : 'PERSPECTIVE';
+}
+
+function toggleHandedness() {
+  state.handedness = state.handedness === 'right' ? 'left' : 'right';
+  document.getElementById('btnHand').textContent = state.handedness === 'right' ? 'RHH' : 'LHH';
+}
+
+function toggleControl() {
+  state.control = state.control === 'click' ? 'wasd' : 'click';
+  const btn = document.getElementById('btnCtrl');
+  btn.textContent = state.control === 'click' ? 'CLICK' : 'WASD';
+}
+
+function score() {
+  const ball = state.ball;
+  if (!ball || !ball.landed) return;
+  const dist = Math.hypot(state.fielder.x - ball.landX, state.fielder.y - ball.landY);
+  let grade, pts;
+  if (ball.caught) {
+    grade = 'CAUGHT!'; pts = 3;
+  } else if (dist < 5)  { grade = 'GREAT!'; pts = 3; }
+  else if (dist < 12) { grade = 'GOOD';   pts = 2; }
+  else if (dist < 25) { grade = 'OK';     pts = 1; }
+  else                { grade = 'MISS';   pts = 0; }
+  state.score.attempts++;
+  state.score.pts += pts;
+  state.score.max += 3;
+  state.result     = { grade, dist, pts, points: pts };
+  state.phase      = 'result';
+  state.resultTimer = 0;
+  const msg = ball.caught ? 'CAUGHT!' : `${grade} — ${dist.toFixed(1)} ft away`;
+  document.getElementById('msg').textContent = msg;
+  document.getElementById('scoreDisplay').textContent = `${state.score.pts} / ${state.score.max}`;
+}
+
+// ===== INPUT =====
+document.addEventListener('keydown', e => {
+  state.keys[e.key.toLowerCase()] = true;
+  if (e.key === ' ') {
+    e.preventDefault();
+    if (state.phase !== 'incoming') newHit();
+  }
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    toggleView();
+  }
+});
+document.addEventListener('keyup', e => { state.keys[e.key.toLowerCase()] = false; });
+
+canvas.addEventListener('click', e => {
+  if (state.phase !== 'incoming') return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) * (canvas.width  / rect.width);
+  const sy = (e.clientY - rect.top)  * (canvas.height / rect.height);
+
+  if (state.view === 'topdown') {
+    const wp = tdInverse(sx, sy);
+    state.target = wp;
+  } else {
+    const cam = makeCamera();
+    const wp = unprojectGround(cam, sx, sy);
+    if (wp) state.target = wp;
+  }
+});
+
+// ===== MAIN LOOP =====
+function update(dt) {
+  state.hitFlash = Math.max(0, state.hitFlash - dt * 4);
+
+  // Auto-tilt camera in perspective mode to track the ball
+  if (state.view === 'perspective') {
+    let targetPitch = 0;
+    const ball = state.ball;
+    if (ball && !ball.landed) {
+      const fx = state.fielder.x, fy = state.fielder.y;
+      const camDist = Math.hypot(fx, fy) || 0.01;
+      const fwdX = -fx / camDist, fwdY = -fy / camDist;
+      const dx = ball.x - fx, dy = ball.y - fy, dz = ball.z - 5.5;
+      const depth = dx * fwdX + dy * fwdY; // how far ahead (toward home plate)
+      targetPitch = Math.atan2(dz, Math.max(8, depth));
+      targetPitch = Math.max(-0.15, Math.min(1.4, targetPitch));
+    }
+    state.pitch += (targetPitch - state.pitch) * Math.min(1, dt * 5);
+  }
+
+  if (state.phase === 'incoming') {
+    const ball = state.ball;
+    {
+      updateBall(ball, dt);
+
+      // Airborne ball passes within reach (handles line drives and fly balls aimed at fielder)
+      if (!ball.landed && ball.z < 10) {
+        const d = Math.hypot(state.fielder.x - ball.x, state.fielder.y - ball.y);
+        if (d < 5) {
+          ball.caught = true;
+          ball.landed = true;
+          ball.landX = ball.x;
+          ball.landY = ball.y;
+        }
+      }
+
+      // Grounder: field it while the ball is rolling low and close
+      if (!ball.landed && ball.bouncing && ball.z < 4) {
+        const d = Math.hypot(state.fielder.x - ball.x, state.fielder.y - ball.y);
+        if (d < 6) {
+          ball.caught = true;
+          ball.landed = true;
+          ball.landX = ball.x;
+          ball.landY = ball.y;
+        }
+      }
+    }
+
+    if (ball.landed) {
+      // Fly ball / liner / popup: caught if fielder is within reach at landing
+      if (!ball.caught && ball.type !== 'grounder') {
+        const d = Math.hypot(state.fielder.x - ball.landX, state.fielder.y - ball.landY);
+        if (d < 8) ball.caught = true;
+      }
+      score();
+      return;
+    }
+
+    // Move fielder with acceleration
+    {
+      let desiredVx = 0, desiredVy = 0;
+
+      if (state.control === 'click') {
+        const dx = state.target.x - state.fielder.x;
+        const dy = state.target.y - state.fielder.y;
+        const d = Math.hypot(dx, dy);
+        if (d > 1) {
+          desiredVx = dx / d * FIELDER_SPEED;
+          desiredVy = dy / d * FIELDER_SPEED;
+        }
+      } else {
+        const cam = makeCamera();
+        let mx = 0, my = 0;
+        const k = state.keys;
+        if (k['w'] || k['arrowup'])    { mx += cam.fwdX;   my += cam.fwdY; }
+        if (k['s'] || k['arrowdown'])  { mx -= cam.fwdX;   my -= cam.fwdY; }
+        if (k['a'] || k['arrowleft'])  { mx -= cam.rightX; my -= cam.rightY; }
+        if (k['d'] || k['arrowright']) { mx += cam.rightX; my += cam.rightY; }
+        const mag = Math.hypot(mx, my);
+        if (mag > 0) { desiredVx = mx / mag * FIELDER_SPEED; desiredVy = my / mag * FIELDER_SPEED; }
+      }
+
+      // Accelerate toward desired velocity
+      const dvx = desiredVx - state.fielder.vx;
+      const dvy = desiredVy - state.fielder.vy;
+      const dv  = Math.hypot(dvx, dvy);
+      const stopping = desiredVx === 0 && desiredVy === 0;
+      const maxDv = (stopping ? FIELDER_DECEL : FIELDER_ACCEL) * dt;
+      if (dv > maxDv) {
+        state.fielder.vx += dvx / dv * maxDv;
+        state.fielder.vy += dvy / dv * maxDv;
+      } else {
+        state.fielder.vx = desiredVx;
+        state.fielder.vy = desiredVy;
+      }
+
+      state.fielder.x += state.fielder.vx * dt;
+      state.fielder.y += state.fielder.vy * dt;
+    }
+
+  } else if (state.phase === 'ready') {
+    state.readyTimer += dt;
+    const left = Math.ceil(1.0 - state.readyTimer);
+    document.getElementById('msg').textContent = left > 0 ? `Ready... ${left}` : 'Ready...';
+    if (state.readyTimer >= 1.0) {
+      state.ball    = createHit(state.pos);
+      state.phase   = 'incoming';
+      state.hitFlash = 1;
+      document.getElementById('msg').textContent =
+        state.control === 'click' ? 'Click landing spot!' : 'Run with WASD!';
+    }
+
+  } else if (state.phase === 'result') {
+    state.resultTimer += dt;
+    if (state.resultTimer > 4) {
+      state.phase = 'idle';
+      document.getElementById('msg').textContent = 'Press SPACE for next hit';
+    }
+  }
+}
+
+function gameLoop(ts) {
+  const dt = state.lastTs ? Math.min((ts - state.lastTs) / 1000, 0.05) : 0.016;
+  state.lastTs = ts;
+  update(dt);
+  if (state.view === 'topdown') renderTopDown();
+  else renderPerspective();
+  requestAnimationFrame(gameLoop);
+}
+
+// Initial render and kick off
+document.getElementById('speedSlider').addEventListener('input', function () {
+  FIELDER_SPEED = parseInt(this.value);
+  document.getElementById('speedLabel').textContent = (FIELDER_SPEED * 0.6818).toFixed(1) + ' mph';
+});
+
+changePosition('cf');
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
