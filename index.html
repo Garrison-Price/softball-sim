@@ -658,33 +658,58 @@ function renderPerspective() {
   ctx.fillStyle = gnd;
   ctx.fillRect(0, horizonY - 2, W, H - horizonY + 2);
 
-  // Mowing stripes — alternating light/dark bands running across the field (world y-axis)
-  // These slide left-right as the camera moves laterally, giving strong motion cues.
+  // World-space grass texture via per-pixel unprojection.
+  // Each screen pixel is mapped back to a world (x, y) coordinate; a fast integer
+  // hash of that coordinate drives both mowing-stripe bands and fine grass noise.
+  // Because the texture is anchored to world space it moves exactly with the camera,
+  // making lateral and forward/backward motion immediately obvious.
   {
-    const stripeW = 15; // feet per stripe
-    for (let yi = 0; yi < cam.y; yi += stripeW) {
-      const y1 = yi, y2 = Math.min(yi + stripeW, cam.y - 0.5);
-      const bl = project(cam, -230, y1, 0);
-      const br = project(cam,  230, y1, 0);
-      const tr = project(cam,  230, y2, 0);
-      const tl = project(cam, -230, y2, 0);
-      if (!bl || !br || !tr || !tl) continue;
-      ctx.fillStyle = Math.floor(yi / stripeW) % 2
-        ? 'rgba(255,255,255,0.05)'
-        : 'rgba(0,0,0,0.08)';
-      ctx.beginPath();
-      ctx.moveTo(bl.x, bl.y); ctx.lineTo(br.x, br.y);
-      ctx.lineTo(tr.x, tr.y); ctx.lineTo(tl.x, tl.y);
-      ctx.closePath(); ctx.fill();
-    }
-    // Convergence lines running toward home plate — make depth and lateral motion obvious
-    for (const wx of [-60, -45, -30, -15, 0, 15, 30, 45, 60]) {
-      const p1 = project(cam, wx, 0, 0);
-      const p2 = project(cam, wx, cam.y - 0.5, 0);
-      if (!p1 || !p2) continue;
-      ctx.strokeStyle = 'rgba(0,0,0,0.07)';
-      ctx.lineWidth = 0.5;
-      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    const groundTop = Math.max(0, horizonY);
+    const groundH   = H - groundTop;
+    if (groundH > 0) {
+      const id   = ctx.getImageData(0, groundTop, W, groundH);
+      const data = id.data;
+      const CX = W / 2, CY = H / 2;
+
+      for (let row = 0; row < groundH; row += 2) {
+        const sy = groundTop + row;
+
+        // Unproject this screen row to the ground plane (z = 0)
+        const ndcY   = -(sy - CY) / cam.FOCAL;
+        const rdz    = ndcY * cam.upZ + cam.lookZ;
+        if (rdz >= 0) continue; // at or above horizon
+        const t      = -cam.z / rdz;
+        const worldY = cam.y + t * (ndcY * cam.upY + cam.lookY);
+        const wxBase = cam.x + t * (ndcY * cam.upX + cam.lookX);
+        const wxStep = t * cam.rightX / cam.FOCAL; // Δworld-x per screen pixel
+
+        // 3-ft mowing stripe: alternating ±12% brightness
+        const stripe = ((Math.floor(worldY / 3) & 1) ? -1 : 1) * 0.12;
+
+        for (let col = 0; col < W; col++) {
+          const worldX = wxBase + wxStep * (col - CX);
+
+          // Integer hash of world position → grass noise
+          const gx = (worldX * 4) | 0;
+          const gy = (worldY * 4) | 0;
+          let h = Math.imul(gx ^ 0x9E3779B9, gy ^ 0x6C62272E);
+          h ^= h >>> 16;
+          const noise = ((h & 0xFF) / 127.5) - 1; // [-1, 1]
+
+          // Brightness = stripe band ± fine noise
+          const bright = 1 + stripe + noise * 0.07;
+
+          const i = (row * W + col) * 4;
+          data[i]   = Math.min(255, data[i]   * bright);
+          data[i+1] = Math.min(255, data[i+1] * bright);
+          data[i+2] = Math.min(255, data[i+2] * bright);
+        }
+
+        // Copy processed row to the one below (skip every other row)
+        if (row + 1 < groundH)
+          data.copyWithin((row + 1) * W * 4, row * W * 4, (row + 1) * W * 4);
+      }
+      ctx.putImageData(id, 0, groundTop);
     }
   }
 
@@ -713,17 +738,7 @@ function renderPerspective() {
     [0,0],[46,46],[0,92],[-46,46]
   ], '#c0935a', null);
 
-  // Infield grass center
-  {
-    const cp = project(cam, 0, 46, 0);
-    if (cp) {
-      const r = Math.max(2, cam.FOCAL / cp.z * 40);
-      ctx.fillStyle = '#308a2a';
-      ctx.beginPath();
-      ctx.arc(cp.x, cp.y, r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
+
 
   // Baselines
   const lineColor = 'rgba(255,255,255,0.65)';
@@ -779,6 +794,65 @@ function renderPerspective() {
       ctx.lineTo(pt.p1.x, pt.p1.y);
       ctx.stroke();
     });
+  }
+
+  // Dugout-side fence: backstop arc behind home plate + low foul-line fence panels
+  {
+    function fenceRails(pts, railColor, postColor, postEvery) {
+      ctx.strokeStyle = railColor; ctx.lineWidth = 1.5;
+      // Bottom, top, and mid rails
+      for (const key of ['p0', 'p1', 'pm']) {
+        ctx.beginPath();
+        let go = false;
+        pts.forEach(pt => {
+          if (!pt) { go = false; return; }
+          go ? ctx.lineTo(pt[key].x, pt[key].y)
+             : (ctx.moveTo(pt[key].x, pt[key].y), go = true);
+        });
+        ctx.stroke();
+      }
+      // Posts
+      ctx.strokeStyle = postColor; ctx.lineWidth = 2.5;
+      pts.forEach((pt, i) => {
+        if (!pt || i % postEvery !== 0) return;
+        ctx.beginPath();
+        ctx.moveTo(pt.p0.x, pt.p0.y);
+        ctx.lineTo(pt.p1.x, pt.p1.y);
+        ctx.stroke();
+      });
+    }
+
+    // Backstop — tall arc behind home plate (~216° to ~324°)
+    {
+      const R = 18, H = 18, SEGS = 12;
+      const A0 = Math.PI * 1.2, A1 = Math.PI * 1.8;
+      const pts = [];
+      for (let i = 0; i <= SEGS; i++) {
+        const a = A0 + (A1 - A0) * i / SEGS;
+        const wx = R * Math.cos(a), wy = R * Math.sin(a);
+        const p0 = project(cam, wx, wy, 0);
+        const p1 = project(cam, wx, wy, H);
+        const pm = project(cam, wx, wy, H * 0.55);
+        pts.push((p0 && p1 && pm) ? { p0, p1, pm } : null);
+      }
+      fenceRails(pts, '#778899', '#99aabb', 2);
+    }
+
+    // Foul-line fence — low panels along each foul line from near home to past corner bases
+    for (const side of [1, -1]) {
+      const dx = side * Math.SQRT1_2, dy = Math.SQRT1_2;
+      const H = 5, T0 = 10, T1 = 72, SEGS = 16;
+      const pts = [];
+      for (let i = 0; i <= SEGS; i++) {
+        const t = T0 + (T1 - T0) * i / SEGS;
+        const wx = dx * t, wy = dy * t;
+        const p0 = project(cam, wx, wy, 0);
+        const p1 = project(cam, wx, wy, H);
+        const pm = project(cam, wx, wy, H * 0.5);
+        pts.push((p0 && p1 && pm) ? { p0, p1, pm } : null);
+      }
+      fenceRails(pts, '#778899', '#99aabb', 4);
+    }
   }
 
   // Pitcher's mound
