@@ -418,12 +418,13 @@ function renderTopDown() {
   ctx.arc(ctr.x, ctr.y, 42 * sc, 0, Math.PI * 2);
   ctx.fill();
 
-  // Pitcher's mound
-  const mp = td(0, MOUND_Y);
-  ctx.fillStyle = '#b58848';
-  ctx.beginPath();
-  ctx.arc(mp.x, mp.y, 5 * sc, 0, Math.PI * 2);
-  ctx.fill();
+  // Pitcher's plate (rubber) — 2 ft wide × 0.5 ft deep white stripe
+  {
+    const pl = td(-1, MOUND_Y + 0.25), pr = td(1, MOUND_Y + 0.25);
+    const pw = pr.x - pl.x, ph = Math.max(2, 0.5 * sc);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(pl.x, pl.y - ph / 2, pw, ph);
+  }
 
   // Outfield fence arc
   ctx.strokeStyle = '#fff';
@@ -478,7 +479,7 @@ function renderTopDown() {
     ball.trail.forEach((pt, i) => {
       const p = td(pt.x, pt.y);
       const a = (i / ball.trail.length) * pt.a * 0.45;
-      ctx.fillStyle = `rgba(255,250,180,${a})`;
+      ctx.fillStyle = `rgba(220,210,0,${a})`;
       ctx.beginPath();
       ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
       ctx.fill();
@@ -509,11 +510,16 @@ function renderTopDown() {
       // Ball
       if (ball.alpha > 0.05) {
         const ballR = Math.max(3, 3.5 + ball.z * sc * 0.04);
-        ctx.fillStyle = `rgba(255,253,200,${ball.alpha})`;
-        ctx.strokeStyle = `rgba(160,145,90,${ball.alpha})`;
+        const bx = gp.x, by = gp.y - heightPx;
+        const grd = ctx.createRadialGradient(bx - ballR*0.3, by - ballR*0.3, ballR*0.05, bx, by, ballR);
+        grd.addColorStop(0,    `rgba(255,255,160,${ball.alpha})`);
+        grd.addColorStop(0.4,  `rgba(225,215,  8,${ball.alpha})`);
+        grd.addColorStop(1,    `rgba(140,130,  0,${ball.alpha})`);
+        ctx.fillStyle = grd;
+        ctx.strokeStyle = `rgba(110,100,0,${ball.alpha})`;
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.arc(gp.x, gp.y - heightPx, ballR, 0, Math.PI * 2);
+        ctx.arc(bx, by, ballR, 0, Math.PI * 2);
         ctx.fill();
         ctx.stroke();
       }
@@ -688,26 +694,38 @@ function renderPerspective() {
         const wxBase = cam.x + t * (ndcY * cam.upX + cam.lookX);
         const wxStep = t * cam.rightX / cam.FOCAL; // Δworld-x per screen pixel
 
-        // 3-ft mowing stripe: alternating ±12% brightness
+        // 3-ft mowing stripe: alternating ±12% brightness (grass only)
         const stripe = ((Math.floor(worldY / 3) & 1) ? -1 : 1) * 0.12;
+        // Rake marks for dirt: sinusoidal brightness along world-y
+        const rake = Math.sin(worldY * Math.PI * 4) * 0.03;
 
         for (let col = 0; col < W; col++) {
           const worldX = wxBase + wxStep * (col - CX);
-
-          // Integer hash of world position → grass noise
-          const gx = (worldX * 4) | 0;
-          const gy = (worldY * 4) | 0;
-          let h = Math.imul(gx ^ 0x9E3779B9, gy ^ 0x6C62272E);
-          h ^= h >>> 16;
-          const noise = ((h & 0xFF) / 127.5) - 1; // [-1, 1]
-
-          // Brightness = stripe band ± fine noise
-          const bright = 1 + stripe + noise * 0.07;
-
           const i = (row * W + col) * 4;
-          data[i]   = Math.min(255, data[i]   * bright);
-          data[i+1] = Math.min(255, data[i+1] * bright);
-          data[i+2] = Math.min(255, data[i+2] * bright);
+
+          if (Math.abs(worldX) + Math.abs(worldY - 46) <= 46) {
+            // ── Infield dirt ── set colour directly so it works from any camera position
+            const gx = (worldX * 2) | 0;   // coarser grain than grass
+            const gy = (worldY * 2) | 0;
+            let h = Math.imul(gx ^ 0x9E3779B9, gy ^ 0x6C62272E);
+            h ^= h >>> 16;
+            const noise  = ((h & 0xFF) / 127.5) - 1;
+            const bright = 1 + noise * 0.10 + rake;
+            data[i]   = Math.min(255, 192 * bright); // #c0935a → R=192
+            data[i+1] = Math.min(255, 147 * bright); //           G=147
+            data[i+2] = Math.min(255,  90 * bright); //           B=90
+          } else {
+            // ── Grass ── modulate the existing gradient pixel
+            const gx = (worldX * 4) | 0;
+            const gy = (worldY * 4) | 0;
+            let h = Math.imul(gx ^ 0x9E3779B9, gy ^ 0x6C62272E);
+            h ^= h >>> 16;
+            const noise  = ((h & 0xFF) / 127.5) - 1;
+            const bright = 1 + stripe + noise * 0.07;
+            data[i]   = Math.min(255, data[i]   * bright);
+            data[i+1] = Math.min(255, data[i+1] * bright);
+            data[i+2] = Math.min(255, data[i+2] * bright);
+          }
         }
 
         // Copy processed row to the one below (skip every other row)
@@ -737,13 +755,6 @@ function renderPerspective() {
     ctx.strokeStyle = col; ctx.lineWidth = lw;
     ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
   }
-
-  // Infield dirt
-  polyFill([
-    [0,0],[46,46],[0,92],[-46,46]
-  ], '#c0935a', null);
-
-
 
   // Baselines
   const lineColor = 'rgba(255,255,255,0.65)';
@@ -860,17 +871,11 @@ function renderPerspective() {
     }
   }
 
-  // Pitcher's mound
-  {
-    const mp = project(cam, 0, MOUND_Y, 0.5);
-    if (mp) {
-      const r = Math.max(1, cam.FOCAL / mp.z * 4);
-      ctx.fillStyle = '#b58848';
-      ctx.beginPath();
-      ctx.ellipse(mp.x, mp.y, r, r * 0.55, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
+  // Pitcher's plate (rubber) — 2 ft wide × 0.5 ft deep white stripe on the ground
+  polyFill([
+    [-1, MOUND_Y - 0.25], [ 1, MOUND_Y - 0.25],
+    [ 1, MOUND_Y + 0.25], [-1, MOUND_Y + 0.25],
+  ], '#ffffff', null);
 
   // Bases
   [[0,0],[46,46],[0,92],[-46,46]].forEach(([bx,by]) => {
@@ -896,13 +901,37 @@ function renderPerspective() {
     const bp = project(cam, ball.x, ball.y, ball.z);
     if (bp && ball.alpha > 0.04) {
       const br = Math.max(2, cam.FOCAL / bp.z * BALL_R_WORLD);
-      ctx.fillStyle = `rgba(255,253,200,${ball.alpha})`;
-      ctx.strokeStyle = `rgba(160,140,80,${ball.alpha})`;
-      ctx.lineWidth = 1;
+      const a  = ball.alpha;
+
+      // Radial gradient — bright highlight top-left, optic yellow mid, olive shadow
+      const grd = ctx.createRadialGradient(
+        bp.x - br * 0.32, bp.y - br * 0.32, br * 0.05,
+        bp.x, bp.y, br
+      );
+      grd.addColorStop(0,    `rgba(255,255,170,${a})`);
+      grd.addColorStop(0.35, `rgba(228,218, 10,${a})`);
+      grd.addColorStop(1,    `rgba(140,132,  0,${a})`);
+      ctx.fillStyle = grd;
       ctx.beginPath();
       ctx.arc(bp.x, bp.y, br, 0, Math.PI * 2);
-      ctx.fill(); ctx.stroke();
+      ctx.fill();
 
+      // Outline
+      ctx.strokeStyle = `rgba(110,100,0,${a})`;
+      ctx.lineWidth = Math.max(0.5, br * 0.06);
+      ctx.stroke();
+
+      // Red seams — two opposing arcs, visible once the ball is big enough
+      if (br > 5) {
+        ctx.strokeStyle = `rgba(190,38,38,${a * 0.9})`;
+        ctx.lineWidth = Math.max(0.7, br * 0.07);
+        ctx.beginPath();
+        ctx.arc(bp.x + br * 0.3, bp.y, br * 0.82, 2.3, 3.98); // left bulge
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(bp.x - br * 0.3, bp.y, br * 0.82, -0.86, 0.86); // right bulge
+        ctx.stroke();
+      }
     }
   }
 
